@@ -1,0 +1,309 @@
+---
+title: "Exercício 5 - Hands on P2 - Aprendizado Supervisionado"
+format: html
+editor: visual
+author: Júlia Zorzo Ferreira
+---
+
+# Preparação dos Dados
+Objetivo: classificação de tumores de mama em dados de Wisconsin (EUA)
+
+## Base
+```{r}
+# install.packages(c("randomMachines", "nnet", "caret"))
+
+library(randomMachines)
+library(nnet)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+url <- "https://archive.ics.uci.edu/static/public/17/data.csv"
+dados_brutos <- read.csv(url)
+```
+
+Verificando a base
+```{r}
+str(dados_brutos)
+str(dados_brutos[, 1:6])
+View(dados_brutos)
+```
+
+569 observações. A resposta é o Diagnosis (M = maligno, B = benigno). Preditoras a serem utilizadas: radius1, texture1, perimeter1 e smoothness1.
+```{r}
+dados <- dados_brutos |>
+  transmute(
+    classe = factor(Diagnosis, levels = c("M", "B")),  # maligno como classe positiva
+    radius1, texture1, perimeter1, smoothness1
+  )
+```
+
+### Análise exploratória
+
+#### Resposta: Diagnóstico
+
+Tabela
+```{r}
+(tab <- data.frame(
+  n = as.vector(table(dados$classe)),
+  prop = round(as.vector(prop.table(table(dados$classe))) * 100, 1),
+  row.names = names(table(dados$classe))
+)) # maioria maligno
+```
+
+Gráfico
+```{r}
+ggplot(dados, aes(x = classe, fill = classe)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+    scale_fill_manual(values = c("M" = "#C2185B", "B" = "#F8BBD0")) +
+  labs(x = "Diagnóstico (M = maligno, B = benigno)", y = "Número de observações") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+#### Preditoras
+radius1, texture1, perimeter1 e smoothness1
+
+```{r}
+summary(dados)
+colSums(is.na(dados))  
+sum(duplicated(dados_brutos$ID))
+```
+
+Não há valores ausentes nem id's duplicados. As preditoras estão em escalas bem diferentes (perimeter1 chega a 188.5, enquanto smoothness1 fica em torno de 0,1), padronizar.
+
+Essas medidas são calculadas a partir núcleos celulares em imagens de massas mamárias pelo método de Fine-needle aspiration (FNA), um procedimento pouco evasivo de aspiração das células por agulhamento.
+
+##### Box-plot
+```{r}
+dados |>
+  pivot_longer(-classe, names_to = "variavel", values_to = "valor") |>
+  ggplot(aes(x = classe, y = valor, fill = classe)) +
+  geom_boxplot() +
+  facet_wrap(~ variavel, scales = "free_y") +
+  labs(x = "Diagnóstico (M = maligno, B = benigno)", y = NULL) +
+    scale_fill_manual(values = c("M" = "#C2185B", "B" = "#F8BBD0")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+# matriz de correlação
+round(cor(dados[, -1]), 2)
+```
+
+```{r}
+cor_df <- as.data.frame(as.table(round(cor(dados[, -1]), 2)))
+names(cor_df) <- c("var1", "var2", "cor")
+
+ggplot(cor_df, aes(x = var1, y = var2, fill = cor)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = cor), size = 4) +
+  scale_fill_gradient2(low = "#F8BBD0", mid = "white", high = "#C2185B",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(x = NULL, y = NULL, fill = "Correlação") +
+  theme_minimal()
+```
+
+## Pré-processamento
+
+### Divisão treino/teste 
+80/20 estratificada
+
+```{r}
+set.seed(123)
+idx <- createDataPartition(dados$classe, p = 0.8, list = FALSE)
+
+treino <- dados[idx, ]
+teste  <- dados[-idx, ]
+
+# conferindo proporções
+prop.table(table(treino$classe)) # M: 0.372807 e B: 0.627193
+prop.table(table(teste$classe))  # M: 0.3716814 e B: 0.6283186
+# resultados satisfatórios
+```
+
+### Padronização das preditoras
+Padronização de escala, para que não haja penalização acidental de valores com maiores magnitudes devido à escalas distintas.
+```{r}
+pre <- preProcess(treino[, -1], method = c("center", "scale"))
+
+x_treino <- predict(pre, treino[, -1])
+x_teste  <- predict(pre, teste[, -1])
+y_treino <- treino$classe
+y_teste  <- teste$classe
+```
+
+# Ajuste e Tunagem dos Modelos
+
+## Validação cruzada
+5-fold estratificado no conjunto de treino
+```{r}
+folds <- createFolds(y_treino, k = 5)
+```
+"Cada modelo e cada combinação de hiperparâmetros é treinado em 4 folds e validado no quinto, repetindo o processo 5 vezes. 
+A média dessas 5 validações é usada para escolher a melhor configuração."
+
+## Métricas
+### Acurácia balanceada
+média entre sensibilidade (classificar corretamente os malignos) e especificidade (classificar corretamente os benignos)
+```{r}
+acc_bal <- function(obs, pred) {
+  sens  <- mean(pred[obs == "M"] == "M")
+  espec <- mean(pred[obs == "B"] == "B")
+  (sens + espec) / 2
+}
+```
+
+### MCC
+Coeficiente de correlação de Matthews (correlação entre a predição e a classe real -> -1 a 1)
+```{r}
+mcc <- function(obs, pred) {
+  tp <- as.numeric(sum(obs == "M" & pred == "M"))
+  tn <- as.numeric(sum(obs == "B" & pred == "B"))
+  fp <- as.numeric(sum(obs == "B" & pred == "M"))
+  fn <- as.numeric(sum(obs == "M" & pred == "B"))
+  den <- sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+  if (den == 0) 0 else (tp * tn - fp * fn) / den
+}
+```
+
+## Modelo MLP
+MLP é o Multilayer Perceptron e, nesse caso, tem as camadas:
+Entrada: 4 preditoras
+Oculta: 1 camada (poucas preditoras e dados -> mais camadas aumentariam a chance de overfitting)
+Saída: neurônio com a probabilidade do tumor ser maligno
+
+Além disso: 
+Hiperparâmetros:
+Número de neurônios (`size`): 2 (mínimo para fronteira não linear) a 15 (quase 4 vezes o número de preditoras) para controlar a capacidade do modelo
+Decaimento de pesos (`decay`): variado em escala logarítmica, de 0 (sem regularização) a 0.5, para cobrir desde a ausência de penalização até uma regularização forte; tentar reduzir overfitting. 
+
+```{r}
+grid_mlp <- expand.grid(
+  size  = c(2, 4, 6, 8, 10, 15),
+  decay = c(0, 0.001, 0.01, 0.1, 0.5)
+) # grid
+
+fit_mlp <- function(x, y, size, decay) {
+  nnet(x = x, y = as.numeric(y == "M"), size = size, decay = decay,
+       maxit = 500, trace = FALSE)
+}
+
+t_cv_mlp <- system.time({ # contabilizar o tempo para comparação
+  cv_mlp <- lapply(seq_len(nrow(grid_mlp)), function(i) {
+    met <- sapply(folds, function(f) {
+      fit  <- fit_mlp(x_treino[-f, ], y_treino[-f], grid_mlp$size[i], grid_mlp$decay[i])
+      p    <- predict(fit, x_treino[f, ], type = "raw")
+      pred <- factor(ifelse(p > 0.5, "M", "B"), levels = c("M", "B"))
+      c(bal = acc_bal(y_treino[f], pred), mcc = mcc(y_treino[f], pred))
+    })
+    rowMeans(met)
+  })
+})
+
+t_cv_mlp[["elapsed"]] # 11.32 segundos e depois 12.18s e depois 11.25
+
+# Resultados
+res_mlp <- cbind(grid_mlp, do.call(rbind, cv_mlp))
+res_mlp[order(-res_mlp$mcc), ][1:5, ]  # top 5
+```
+
+
+## Modelo Random Machines
+Random Machines: Ensemble de SVMs com bagging, em que cada base learner usa um kernel sorteado entre os tipos radial, polinomial, laplaciano e linear. 
+
+Hiperparâmetros:
+Custo (`cost`): controla a penalização dos erros na margem (distância entre o hiperplano e os vetores de suporte), os valores escolhidos cobrem penalizações baixas, permitindo mais erros de treino, e altas, deixando a margem pequena.
+Parâmetro de largura dos kernels radial e laplaciano (`gamma`): controla a largura da influência de cada observação na fronteira de decisão. Também cobre intervalo de fronteira suave e mais restrita.
+O número de bootstraps foi fixado em `B = 25`, valor padrão do pacote -> informação disponível na documentação do pacote do R.
+
+```{r}
+grid_rm <- expand.grid(
+  cost  = c(0.5, 1, 5, 10),
+  gamma = c(0.05, 0.1, 0.25, 0.5, 1)
+)
+
+fit_rm <- function(x, y, cost, gamma) {
+  randomMachines(classe ~ ., train = data.frame(classe = y, x),
+                 B = 25, cost = cost,
+                 gamma_rbf = gamma, gamma_lap = gamma,
+                 prob_model = FALSE)
+}
+
+t_cv_rm <- system.time({
+  cv_rm <- lapply(seq_len(nrow(grid_rm)), function(i) {
+    met <- sapply(folds, function(f) {
+      fit  <- fit_rm(x_treino[-f, ], y_treino[-f], grid_rm$cost[i], grid_rm$gamma[i])
+      pred <- factor(predict(fit, x_treino[f, ]), levels = c("M", "B"))
+      c(bal = acc_bal(y_treino[f], pred), mcc = mcc(y_treino[f], pred))
+    })
+    rowMeans(met)
+  })
+})
+
+t_cv_rm[["elapsed"]] #167.69, cerca de 2min48s depois 190.7, 3min11s, 3min5s
+
+res_rm <- cbind(grid_rm, do.call(rbind, cv_rm))
+res_rm[order(-res_rm$mcc), ][1:5, ]  # top 5 
+```
+
+## Melhores modelos obtidos
+Escolha por mcc porque é robusto a classes desbalanceadas e os dois tiveram também as melhores acurácias balanceadas.
+
+### MLP
+```{r}
+fit_final_mlp <- fit_mlp(x_treino, y_treino, best_mlp$size, best_mlp$decay)
+prob_teste    <- as.vector(predict(fit_final_mlp, x_teste, type = "raw"))
+pred_mlp      <- factor(ifelse(prob_teste > 0.5, "M", "B"), levels = c("M", "B"))
+```
+
+### Random Machines
+```{r}
+fit_final_rm <- fit_rm(x_treino, y_treino, best_rm$cost, best_rm$gamma)
+pred_rm      <- factor(predict(fit_final_rm, x_teste), levels = c("M", "B"))
+```
+
+
+# Avaliação e Comparação
+
+## Desempenho do conjunto teste
+Avaliação por meio da acurácia bancelada, mcc e matriz de confusão.
+
+### Acur.b e MCC
+```{r}
+# matrizes de confusão
+table(pred_mlp, y_teste)
+table(pred_rm,  y_teste)
+
+# métricas no teste
+(resultados <- data.frame(
+  modelo = c("MLP", "Random Machines"),
+  acuracia_balanceada = c(acc_bal(y_teste, pred_mlp), acc_bal(y_teste, pred_rm)),
+  mcc = c(mcc(y_teste, pred_mlp), mcc(y_teste, pred_rm))
+))
+```
+
+```{r}
+cm_df <- rbind(
+  data.frame(modelo = "MLP", as.data.frame(table(Previsto = pred_mlp, Real = y_teste))),
+  data.frame(modelo = "Random Machines", as.data.frame(table(Previsto = pred_rm, Real = y_teste)))
+)
+
+ggplot(cm_df, aes(x = Real, y = Previsto, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 6) +
+  facet_wrap(~ modelo) +
+  scale_x_discrete(limits = c("M", "B")) +
+  scale_y_discrete(limits = c("B", "M")) +
+  scale_fill_gradient(low = "#F8BBD0", high = "#C2185B") +
+  labs(x = "Real", y = "Previsto", fill = "Observações") +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 13, face = "bold"))
+```
+O que falta:
+Compare os resultados,
+discutindo as diferenças de desempenho preditivo, complexidade dos modelos e custo computacional.
+
